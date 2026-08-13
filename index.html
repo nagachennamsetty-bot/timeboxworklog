@@ -392,6 +392,7 @@ document.addEventListener('DOMContentLoaded', async function() {
   (function() {
     var STORAGE_KEY = 'timebox-worklog-v1';
     var DRIVE_FILE_NAME = 'timebox-worklog-v1.json';
+    var ATTACH_FOLDER_NAME = 'Timebox Attachments';
     var CLIENT_ID = '805430460887-nd99t0fk6d10a8ab7bl7dcapnc5592m0.apps.googleusercontent.com';
     var DRIVE_SCOPE = 'https://www.googleapis.com/auth/drive.file';
 
@@ -400,6 +401,7 @@ document.addEventListener('DOMContentLoaded', async function() {
 
     var accessToken = null;
     var driveFileId = null;
+    var attachFolderId = null;
     var saveTimer = null;
     var tokenClient = null;
     var statusPill = null;
@@ -425,13 +427,22 @@ document.addEventListener('DOMContentLoaded', async function() {
         client_id: CLIENT_ID,
         scope: DRIVE_SCOPE,
         callback: function(resp) {
-          if (resp.error) { setStatus('Drive: sign-in failed', false); return; }
+          if (resp.error) {
+            if (resp.error !== 'immediate_failed' && resp.error !== 'user_logout') {
+              setStatus('Drive: sign-in failed', false);
+            } else {
+              setStatus('Drive: click to connect', false);
+            }
+            return;
+          }
           accessToken = resp.access_token;
           setStatus('Drive: connected, syncing…', true);
           findOrCreateFile();
         },
       });
-      setStatus('Drive: click to connect', false);
+      setStatus('Drive: connecting…', false);
+      // Attempt a silent reconnect first — no popup — using the existing Google session.
+      tokenClient.requestAccessToken({ prompt: '' });
     }
 
     function findOrCreateFile() {
@@ -508,6 +519,118 @@ document.addEventListener('DOMContentLoaded', async function() {
       .catch(function() { setStatus('Drive: sync failed (offline?)', false); });
     }
 
+    // ---- Attachment folder + file upload ----
+    function getAttachFolder(cb) {
+      if (attachFolderId) { cb(attachFolderId); return; }
+      var q = encodeURIComponent("name = '" + ATTACH_FOLDER_NAME + "' and mimeType = 'application/vnd.google-apps.folder' and trashed = false");
+      fetch('https://www.googleapis.com/drive/v3/files?q=' + q + '&spaces=drive&fields=files(id,name)', {
+        headers: { Authorization: 'Bearer ' + accessToken }
+      })
+      .then(function(r) { return r.json(); })
+      .then(function(data) {
+        if (data.files && data.files.length > 0) {
+          attachFolderId = data.files[0].id;
+          cb(attachFolderId);
+        } else {
+          fetch('https://www.googleapis.com/drive/v3/files', {
+            method: 'POST',
+            headers: { Authorization: 'Bearer ' + accessToken, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ name: ATTACH_FOLDER_NAME, mimeType: 'application/vnd.google-apps.folder' })
+          })
+          .then(function(r) { return r.json(); })
+          .then(function(folder) { attachFolderId = folder.id; cb(attachFolderId); });
+        }
+      });
+    }
+
+    function uploadAttachment(file, onDone) {
+      if (!accessToken) { alert('Connect Google Drive first — click the status pill top-right.'); return; }
+      getAttachFolder(function(folderId) {
+        var metadata = { name: file.name, parents: [folderId] };
+        var boundary = '-------tbxattach';
+        var reader = new FileReader();
+        reader.onload = function() {
+          var base64Data = btoa(reader.result);
+          var body = '--' + boundary + '\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n' +
+            JSON.stringify(metadata) + '\r\n--' + boundary + '\r\nContent-Type: ' + (file.type || 'application/octet-stream') +
+            '\r\nContent-Transfer-Encoding: base64\r\n\r\n' + base64Data + '\r\n--' + boundary + '--';
+          fetch('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,webViewLink', {
+            method: 'POST',
+            headers: {
+              Authorization: 'Bearer ' + accessToken,
+              'Content-Type': 'multipart/related; boundary=' + boundary
+            },
+            body: body
+          })
+          .then(function(r) { return r.json(); })
+          .then(function(data) { onDone(data); })
+          .catch(function() { alert('Upload failed — check your connection and try again.'); });
+        };
+        reader.onerror = function() { alert('Could not read that file.'); };
+        reader.readAsBinaryString(file);
+      });
+    }
+
+    function wireDocInputs() {
+      var inputs = document.querySelectorAll('input.input[placeholder="+ attach doc/link"]');
+      inputs.forEach(function(inp) {
+        if (inp.dataset.tbWired) return;
+        inp.dataset.tbWired = '1';
+
+        var wrap = document.createElement('span');
+        wrap.style.cssText = 'display:inline-flex;align-items:center;gap:2px;';
+        inp.parentNode.insertBefore(wrap, inp);
+        wrap.appendChild(inp);
+
+        var clipBtn = document.createElement('button');
+        clipBtn.type = 'button';
+        clipBtn.textContent = '📎';
+        clipBtn.title = 'Attach a file (PDF, code, etc.) to Google Drive';
+        clipBtn.style.cssText = 'border:none;background:transparent;cursor:pointer;font-size:11px;padding:0 2px;';
+        wrap.appendChild(clipBtn);
+
+        var openBtn = document.createElement('a');
+        openBtn.textContent = '🔗';
+        openBtn.title = 'Open';
+        openBtn.target = '_blank';
+        openBtn.rel = 'noopener';
+        openBtn.style.cssText = 'font-size:11px;padding:0 2px;text-decoration:none;display:none;';
+        wrap.appendChild(openBtn);
+
+        function refreshOpenBtn() {
+          var v = inp.value.trim();
+          if (/^https?:\/\//.test(v)) { openBtn.href = v; openBtn.style.display = 'inline'; }
+          else { openBtn.style.display = 'none'; }
+        }
+        refreshOpenBtn();
+        inp.addEventListener('input', refreshOpenBtn);
+
+        var fileInput = document.createElement('input');
+        fileInput.type = 'file';
+        fileInput.style.display = 'none';
+        fileInput.accept = '.pdf,.doc,.docx,.txt,.md,.js,.ts,.jsx,.tsx,.py,.json,.csv,.xlsx,.zip,.png,.jpg,.jpeg,.html,.css,.java,.c,.cpp,.sql,.yaml,.yml';
+        wrap.appendChild(fileInput);
+        clipBtn.addEventListener('click', function() { fileInput.click(); });
+        fileInput.addEventListener('change', function(e) {
+          var file = e.target.files && e.target.files[0];
+          if (!file) return;
+          clipBtn.textContent = '⏳';
+          uploadAttachment(file, function(result) {
+            clipBtn.textContent = '📎';
+            if (result && result.webViewLink) {
+              inp.value = result.webViewLink;
+              inp.dispatchEvent(new Event('input', { bubbles: true }));
+              inp.dispatchEvent(new Event('change', { bubbles: true }));
+              refreshOpenBtn();
+            } else {
+              alert('Upload may have failed — check Drive directly.');
+            }
+          });
+          fileInput.value = '';
+        });
+      });
+    }
+
     function addBackupControls(navRow) {
       if (document.getElementById('__tb_export_btn')) return;
 
@@ -521,7 +644,7 @@ document.addEventListener('DOMContentLoaded', async function() {
       statusPill.addEventListener('click', function() {
         if (!accessToken) {
           if (!tokenClient) { alert('Still loading Google sign-in — try again in a second.'); return; }
-          tokenClient.requestAccessToken();
+          tokenClient.requestAccessToken({ prompt: 'consent' });
         }
       });
 
@@ -558,11 +681,11 @@ document.addEventListener('DOMContentLoaded', async function() {
       importBtn.textContent = 'Import';
       importBtn.style.marginLeft = '4px';
 
-      var fileInput = document.createElement('input');
-      fileInput.type = 'file';
-      fileInput.accept = 'application/json';
-      fileInput.style.display = 'none';
-      fileInput.addEventListener('change', function(e) {
+      var fileInputBackup = document.createElement('input');
+      fileInputBackup.type = 'file';
+      fileInputBackup.accept = 'application/json';
+      fileInputBackup.style.display = 'none';
+      fileInputBackup.addEventListener('change', function(e) {
         var file = e.target.files && e.target.files[0];
         if (!file) return;
         var reader = new FileReader();
@@ -578,13 +701,17 @@ document.addEventListener('DOMContentLoaded', async function() {
           }
         };
         reader.readAsText(file);
-        fileInput.value = '';
+        fileInputBackup.value = '';
       });
-      importBtn.addEventListener('click', function() { fileInput.click(); });
+      importBtn.addEventListener('click', function() { fileInputBackup.click(); });
 
       navRow.appendChild(exportBtn);
       navRow.appendChild(importBtn);
-      navRow.appendChild(fileInput);
+      navRow.appendChild(fileInputBackup);
+
+      wireDocInputs();
+      var docObserver = new MutationObserver(function() { wireDocInputs(); });
+      docObserver.observe(document.body, { childList: true, subtree: true });
     }
 
     function tryAttach() {
